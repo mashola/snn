@@ -16,7 +16,7 @@ jobs:
       - name: Install FFmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg libavcodec-extra
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -25,6 +25,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
+          pip install --upgrade pip
           pip install feedparser requests edge-tts deep-translator
 
       - name: Run Broadcast Engine
