@@ -5,6 +5,7 @@ import requests
 import feedparser
 import subprocess
 import edge_tts
+from gtts import gTTS
 from deep_translator import GoogleTranslator
 
 # Configuration - Stream to YouTube RTMP servers
@@ -44,21 +45,45 @@ def get_news():
             print(f"Feed error: {e}")
     return articles
 
-async def generate_audio_with_retry(text, voice, outfile, retries=3):
-    """Generates audio with a retry mechanism for robustness."""
-    for i in range(retries):
-        try:
-            communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(outfile)
-            if os.path.exists(outfile) and os.path.getsize(outfile) > 0:
-                return True
-        except Exception as e:
-            print(f"TTS Attempt {i+1} failed: {e}")
-            await asyncio.sleep(2)
-    return False
+async def generate_audio_with_fallback(text, index):
+    """Generates audio with multiple fallbacks (Microsoft Neural -> gTTS)."""
+    outfile = f"audio_{index}.mp3"
+    
+    # Clean text: Remove quotes and special characters that crash TTS
+    clean_text = text.replace('"', '').replace("'", "").replace("\n", " ").strip()
+
+    # Try Microsoft Neural (Voice 1: TZ)
+    try:
+        communicate = edge_tts.Communicate(clean_text, "sw-TZ-LughaNeural")
+        await communicate.save(outfile)
+        if os.path.exists(outfile) and os.path.getsize(outfile) > 100:
+            return outfile
+    except Exception as e:
+        print(f"Microsoft TTS (TZ) failed: {e}")
+
+    # Try Microsoft Neural (Voice 2: KE)
+    try:
+        communicate = edge_tts.Communicate(clean_text, "sw-KE-ZuriNeural")
+        await communicate.save(outfile)
+        if os.path.exists(outfile) and os.path.getsize(outfile) > 100:
+            return outfile
+    except Exception as e:
+        print(f"Microsoft TTS (KE) failed: {e}")
+
+    # Final Fallback: gTTS (Google - Very reliable)
+    try:
+        print(f"Segment {index}: Using gTTS fallback...")
+        tts = gTTS(text=clean_text, lang='sw')
+        tts.save(outfile)
+        if os.path.exists(outfile) and os.path.getsize(outfile) > 100:
+            return outfile
+    except Exception as e:
+        print(f"Final Fallback gTTS failed: {e}")
+    
+    return None
 
 async def generate_assets(news_item, index):
-    """Translates content, generates neural voice, and renders 1080p video."""
+    """Translates content, generates audio, and renders 1080p video."""
     try:
         # 1. Translation
         print(f"Segment {index}: Translating...")
@@ -66,26 +91,20 @@ async def generate_assets(news_item, index):
         translated = translator.translate(news_item['summary'])
         
         if not translated or len(translated.strip()) < 5:
-            translated = news_item['title'] # Fallback to title if summary fails
+            translated = news_item['title']
 
         script = " ".join(translated.split()[:80]) + "."
 
-        # 2. High Quality Microsoft Neural TTS
+        # 2. Audio Generation
         print(f"Segment {index}: Generating Audio...")
-        # primary voice: sw-TZ-LughaNeural, fallback: sw-KE-ZuriNeural
-        audio_file = f"audio_{index}.mp3"
-        success = await generate_audio_with_retry(script, "sw-TZ-LughaNeural", audio_file)
+        audio_file = await generate_audio_with_fallback(script, index)
         
-        if not success:
-            print(f"Segment {index}: Trying fallback voice...")
-            success = await generate_audio_with_retry(script, "sw-KE-ZuriNeural", audio_file)
+        if not audio_file:
+            raise Exception("All audio engines failed.")
 
-        if not success:
-            raise Exception("Failed to generate audio after multiple attempts.")
-
-        # 3. Download Image
+        # 3. Image Download
         img_file = f"image_{index}.jpg"
-        img_res = requests.get(news_item['image'], timeout=15)
+        img_res = requests.get(news_item['image'], timeout=20)
         with open(img_file, 'wb') as f:
             f.write(img_res.content)
 
@@ -93,6 +112,7 @@ async def generate_assets(news_item, index):
         output_video = f"segment_{index}.mp4"
         print(f"Segment {index}: Rendering Video...")
         
+        # Get audio duration
         duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_file]
         duration = subprocess.check_output(duration_cmd).decode('utf-8').strip()
 
@@ -102,9 +122,16 @@ async def generate_assets(news_item, index):
             '-vf', "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=20:5 [bg]; [0:v] scale=1920:1080:force_original_aspect_ratio=decrease [fg]; [bg][fg] overlay=(W-w)/2:(H-h)/2",
             '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-b:a', '128k', '-shortest', output_video
         ]
-        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        return output_video
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"FFmpeg Render Error: {result.stderr}")
+            return None
+        
+        if os.path.exists(output_video) and os.path.getsize(output_video) > 1000:
+            return output_video
+        
+        return None
     except Exception as e:
         print(f"Error in segment {index}: {e}")
         return None
@@ -114,6 +141,9 @@ async def broadcast_loop():
         print("CRITICAL: YOUTUBE_STREAM_KEY secret is missing!")
         return
 
+    # Clear old playlist if exists
+    if os.path.exists("playlist.txt"): os.remove("playlist.txt")
+
     while True:
         items = get_news()
         video_segments = []
@@ -122,10 +152,10 @@ async def broadcast_loop():
             video = await generate_assets(item, i)
             if video:
                 video_segments.append(video)
-                await asyncio.sleep(1) # Small delay to prevent rate limiting
+                await asyncio.sleep(2) # Prevent slamming the CPU/Network
         
         if not video_segments:
-            print("No segments generated. Waiting 60s...")
+            print("No segments generated. Waiting 60s to retry...")
             await asyncio.sleep(60)
             continue
 
@@ -141,8 +171,11 @@ async def broadcast_loop():
             '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
             '-f', 'flv', f"{YOUTUBE_URL}{STREAM_KEY}"
         ]
+        
+        # This will block until the playlist finishes playing
         subprocess.run(stream_cmd)
         
+        # Periodic Cleanup
         for f in os.listdir():
             if f.endswith((".mp4", ".mp3", ".jpg")):
                 try: os.remove(f)
